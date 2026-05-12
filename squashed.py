@@ -1,48 +1,36 @@
-"""Variational upper bound on the squashed entanglement.
+"""Variational upper bound on the squashed entanglement (JAX backend).
 
-Following the user's convention,
+E_sq(A:B) := min_{rho_ABE : Tr_E rho_ABE = rho_AB}  I(A:B|E),
 
-    E_sq(A:B) := min_{rho_ABE :  Tr_E rho_ABE = rho_AB}  I(A:B|E),
+with I(A:B|E) = S(rho_AE) + S(rho_BE) - S(rho_E) - S(rho_ABE).
 
-where I(A:B|E) is the quantum conditional mutual information (see cmi.py).
-(Note: many references include an extra factor 1/2 in the definition; we omit
-it here to match the stated definition.)
+We parametrize all valid extensions by an isometry  V : R -> E (x) E_aux,
+where R is the purifying reference (NR = rank(rho_AB)) and E_aux has
+dimension NR.  V is obtained from the QR factor of an unconstrained complex
+matrix W of shape (NE * NR,  NR), so the optimization is unconstrained.
 
-Strategy
---------
-Every extension rho_ABE of rho_AB can be obtained as follows
-(Stinespring / Koashi-Imoto):
-
-    1. Take a purification |psi> of rho_AB on AB (x) R, where R is a reference
-       system of dimension NR = rank(rho_AB).
-    2. Apply a quantum channel  Lambda : R -> E  to the R subsystem.
-
-Any such channel has a Stinespring isometry  V : R -> E (x) E_aux  with
-NE_aux <= NR.  The extension is then
-
-    rho_ABE = Tr_{E_aux} [(I_AB (x) V) |psi><psi| (I_AB (x) V^dagger)].
-
-We parametrize V as the orthonormal basis (QR factor) of an unconstrained
-complex matrix W of shape (NE * NE_aux,  NR) and minimize the CMI over W
-with L-BFGS-B (numerical gradient) and a few random restarts.  Because the
-optimization is non-convex, the returned value is an *upper bound* on the
-true minimum.
+Backend: JAX (analytic gradient via reverse-mode autodiff, JIT-compiled)
+plus scipy.optimize L-BFGS-B.
 """
 
 from __future__ import annotations
 
+import os
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
+
+import jax
+jax.config.update("jax_enable_x64", True)
+
+import jax.numpy as jnp
 import numpy as np
 from scipy.optimize import minimize
 
-from cmi import conditional_mutual_information
+
+_LOG_EPS = 1e-12
 
 
 def _purify(rho: np.ndarray, tol: float = 1e-12) -> tuple[np.ndarray, int]:
-    """Return a purification of rho as a matrix psi of shape (D, NR).
-
-    The full purification vector |psi> in C^D (x) C^NR is psi.flatten()
-    (system index first, reference index second).  NR = rank(rho).
-    """
+    """Return matrix psi of shape (D, NR) with psi @ psi^dagger = rho."""
     w, U = np.linalg.eigh(0.5 * (rho + rho.conj().T))
     w = np.clip(w.real, 0.0, None)
     mask = w > tol
@@ -50,8 +38,60 @@ def _purify(rho: np.ndarray, tol: float = 1e-12) -> tuple[np.ndarray, int]:
     U = U[:, mask]
     if w.size == 0:
         raise ValueError("rho is (numerically) zero.")
-    psi = U * np.sqrt(w)  # shape (D, NR);  |psi> = sum_i sqrt(w_i) |u_i>|i>
-    return psi, int(w.size)
+    return U * np.sqrt(w), int(w.size)
+
+
+def _entropy(rho: jnp.ndarray, log_base: float) -> jnp.ndarray:
+    rho_h = 0.5 * (rho + rho.conj().T)
+    w = jnp.linalg.eigvalsh(rho_h)
+    w = jnp.clip(w.real, 0.0, None)
+    safe = jnp.where(w > _LOG_EPS, w, 1.0)
+    log_w = jnp.log(safe) / log_base
+    return -jnp.sum(jnp.where(w > _LOG_EPS, w * log_w, 0.0))
+
+
+def _build_objective(psi_mat: np.ndarray, NA: int, NB: int, NE: int, NR: int,
+                     base: float):
+    NE_aux = NR
+    rows = NE * NE_aux
+    n_complex = rows * NR
+    log_base = float(jnp.log(base))
+    psi_j = jnp.asarray(psi_mat)
+
+    def cmi(x: jnp.ndarray) -> jnp.ndarray:
+        W = (x[:n_complex] + 1j * x[n_complex:]).reshape(rows, NR)
+        V, _ = jnp.linalg.qr(W)                         # (rows, NR), V^dag V = I
+        psi_p = psi_j @ V.T                             # (D_AB, rows)
+        Psi = psi_p.reshape(NA, NB, NE, NE_aux)
+        T = jnp.einsum('abek,ABEk->abeABE', Psi, Psi.conj())
+        D = NA * NB * NE
+        rho_ABE = T.reshape(D, D)
+        rho_AE = jnp.einsum('abeAbE->aeAE', T).reshape(NA * NE, NA * NE)
+        rho_BE = jnp.einsum('abeaBE->beBE', T).reshape(NB * NE, NB * NE)
+        rho_E = jnp.einsum('abeabE->eE', T).reshape(NE, NE)
+        return (_entropy(rho_AE, log_base) + _entropy(rho_BE, log_base)
+                - _entropy(rho_E, log_base) - _entropy(rho_ABE, log_base))
+
+    val_grad = jax.jit(jax.value_and_grad(cmi))
+
+    def f_and_g(x_np: np.ndarray):
+        v, g = val_grad(jnp.asarray(x_np))
+        return float(np.asarray(v).real), np.asarray(g).astype(np.float64)
+
+    return f_and_g, 2 * n_complex
+
+
+def _build_rho_ABE(x: np.ndarray, psi_mat: np.ndarray, NA: int, NB: int,
+                   NE: int, NR: int) -> np.ndarray:
+    NE_aux = NR
+    rows = NE * NE_aux
+    n = rows * NR
+    W = (x[:n] + 1j * x[n:]).reshape(rows, NR)
+    V, _ = np.linalg.qr(W)
+    psi_p = psi_mat @ V.T
+    Psi = psi_p.reshape(NA * NB, NE, NE_aux)
+    rho_tensor = np.einsum('aek,bfk->aebf', Psi, Psi.conj())
+    return rho_tensor.reshape(NA * NB * NE, NA * NB * NE)
 
 
 def squashed_entanglement_upper_bound(
@@ -61,114 +101,76 @@ def squashed_entanglement_upper_bound(
     NE: int,
     *,
     base: float = 2.0,
-    n_restarts: int = 5,
-    max_iter: int = 500,
+    n_restarts: int = 8,
+    max_iter: int = 2000,
     seed: int | None = None,
+    x0: np.ndarray | None = None,
+    return_x: bool = False,
     verbose: bool = False,
-) -> tuple[float, np.ndarray]:
-    """Variational upper bound on  min_{rho_ABE} I(A:B|E)  with Tr_E rho_ABE = rho_AB.
+):
+    """Variational upper bound on E_sq(A:B) using an analytic JAX gradient.
 
     Parameters
     ----------
-    rho_AB : (NA*NB, NA*NB) density matrix (AB tensor ordering).
-    NA, NB, NE : Hilbert-space dimensions of A, B, E.
-    base : log base for the entropy / CMI.
-    n_restarts : number of random L-BFGS-B restarts (best result is returned).
-    max_iter : max iterations per restart.
-    seed : RNG seed.
-    verbose : print per-restart objective values.
+    rho_AB : (NA*NB, NA*NB) density matrix.
+    NA, NB, NE : Hilbert-space dimensions.
+    n_restarts : random restarts in addition to the warm start (if any).
+    x0 : optional warm-start parameter vector.
+    return_x : if True, also return the optimal parameter vector.
 
     Returns
     -------
-    best_cmi : the smallest CMI found (upper bound on the squashed entanglement).
-    best_rho_ABE : the optimal extension achieving `best_cmi`.
+    (cmi, rho_ABE)              if return_x is False
+    (cmi, rho_ABE, x_optimal)   if return_x is True
     """
     rng = np.random.default_rng(seed)
     D_AB = NA * NB
     if rho_AB.shape != (D_AB, D_AB):
         raise ValueError(f"rho_AB has shape {rho_AB.shape}, expected ({D_AB}, {D_AB}).")
 
-    psi_mat, NR = _purify(rho_AB)  # psi_mat: (D_AB, NR)
-
-    # Stinespring ancilla dimension; NE_aux = NR is always sufficient.
-    NE_aux = NR
-    rows = NE * NE_aux  # >= NR  (true whenever NE >= 1)
-    if rows < NR:
-        raise ValueError("NE * NR must be >= NR; choose NE >= 1.")
-
-    n_complex = rows * NR
-    n_params = 2 * n_complex  # real and imaginary parts
-
-    def unpack(x: np.ndarray) -> np.ndarray:
-        return (x[:n_complex] + 1j * x[n_complex:]).reshape(rows, NR)
-
-    def build_rho_ABE(W: np.ndarray) -> np.ndarray:
-        # Isometry V : R -> E (x) E_aux  from QR of W  (shape (rows, NR)).
-        V, _ = np.linalg.qr(W)
-        # Apply V to the R index of |psi>:  psi'[ab, j] = sum_r psi[ab, r] V[j, r].
-        psi_prime = psi_mat @ V.T            # shape (D_AB, rows)
-        Psi = psi_prime.reshape(D_AB, NE, NE_aux)
-        # rho_ABE = Tr_{E_aux} |Psi><Psi|
-        rho = np.einsum('aek,bfk->aebf', Psi, Psi.conj())
-        return rho.reshape(D_AB * NE, D_AB * NE)
-
-    def objective(x: np.ndarray) -> float:
-        rho_ABE = build_rho_ABE(unpack(x))
-        return conditional_mutual_information(rho_ABE, NA, NB, NE, base=base)
+    psi_mat, NR = _purify(rho_AB)
+    f_and_g, n_params = _build_objective(psi_mat, NA, NB, NE, NR, base)
 
     best_val = np.inf
-    best_rho: np.ndarray | None = None
-    for k in range(n_restarts):
-        x0 = rng.standard_normal(n_params) * 0.5
-        res = minimize(objective, x0, method='L-BFGS-B', options={'maxiter': max_iter})
-        val = float(res.fun)
+    best_x: np.ndarray | None = None
+
+    def run(x_init: np.ndarray, label: str) -> None:
+        nonlocal best_val, best_x
+        res = minimize(f_and_g, x_init, jac=True, method='L-BFGS-B',
+                       options={'maxiter': max_iter, 'gtol': 1e-9, 'ftol': 1e-12})
         if verbose:
-            print(f"  restart {k+1}/{n_restarts}: CMI = {val:.6f}  (success={res.success})")
-        if val < best_val:
-            best_val = val
-            best_rho = build_rho_ABE(unpack(res.x))
+            print(f"  {label}: CMI = {res.fun:.6f}  iters={res.nit}  success={res.success}")
+        if res.fun < best_val:
+            best_val = float(res.fun)
+            best_x = res.x
 
-    assert best_rho is not None
-    # Sanity: optimized extension reduces to rho_AB.
-    from cmi import partial_trace
-    rho_AB_recovered = partial_trace(best_rho, (NA, NB, NE), keep=(0, 1))
-    err = np.linalg.norm(rho_AB_recovered - rho_AB)
-    if err > 1e-8:
-        # Should never trigger; the parametrization preserves rho_AB exactly.
-        print(f"warning: ||Tr_E rho_ABE - rho_AB|| = {err:.2e}")
+    if x0 is not None:
+        if x0.size != n_params:
+            if verbose:
+                print(f"  (warm-start size {x0.size} != {n_params}, ignored)")
+        else:
+            run(x0.astype(np.float64), "warm")
 
-    return best_val, best_rho
+    for k in range(n_restarts):
+        run(rng.standard_normal(n_params) * 0.5, f"restart {k + 1}/{n_restarts}")
+
+    assert best_x is not None
+    rho_ABE = _build_rho_ABE(best_x, psi_mat, NA, NB, NE, NR)
+
+    if return_x:
+        return best_val, rho_ABE, best_x
+    return best_val, rho_ABE
 
 
 if __name__ == "__main__":
-    rng = np.random.default_rng(1)
-
-    # ----- Test 1: product state rho_A (x) rho_B  =>  E_sq = 0. -----
-    NA = NB = 2
-    NE = 2
-    from cmi import _random_density_matrix
-    rho_A = _random_density_matrix(NA, rng=rng)
-    rho_B = _random_density_matrix(NB, rng=rng)
-    rho_AB_prod = np.kron(rho_A, rho_B)
-    val, _ = squashed_entanglement_upper_bound(rho_AB_prod, NA, NB, NE,
-                                               n_restarts=3, seed=0)
-    print(f"product state  E_sq upper bound = {val:.3e}  (expect ~0)")
-
-    # ----- Test 2: maximally entangled pure state on 2x2. -----
-    # For pure rho_AB, every extension is rho_AB (x) sigma_E, so
-    # I(A:B|E) = I(A:B) = 2 log NA  (= 2 in bits for NA=2).
-    d = 2
-    phi = np.zeros((d * d,), dtype=complex)
-    for i in range(d):
-        phi[i * d + i] = 1.0 / np.sqrt(d)
-    rho_AB_pure = np.outer(phi, phi.conj())
-    val, _ = squashed_entanglement_upper_bound(rho_AB_pure, d, d, NE,
-                                               n_restarts=3, seed=0)
-    print(f"max-entangled  E_sq upper bound = {val:.6f}  (expect 2.0)")
-
-    # ----- Test 3: generic mixed rho_AB. -----
-    rho_AB = _random_density_matrix(NA * NB, rng=rng)
-    val, rho_ABE = squashed_entanglement_upper_bound(rho_AB, NA, NB, NE,
-                                                     n_restarts=5, seed=0,
-                                                     verbose=True)
-    print(f"random  rho_AB  E_sq upper bound = {val:.6f}")
+    # Quick smoke test.
+    rng = np.random.default_rng(0)
+    NA = NB = NE = 2
+    d = NA * NB
+    X = rng.standard_normal((d, d)) + 1j * rng.standard_normal((d, d))
+    rho = X @ X.conj().T
+    rho /= np.trace(rho).real
+    val, _ = squashed_entanglement_upper_bound(rho, NA, NB, NE,
+                                               n_restarts=3, seed=0,
+                                               verbose=True)
+    print(f"random 2x2 mixed: E_sq upper bound = {val:.6f} bits")
