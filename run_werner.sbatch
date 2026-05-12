@@ -20,9 +20,6 @@ set -euo pipefail
 
 mkdir -p logs results
 
-# Activate the project venv (adjust path as needed on the cluster).
-source .venv/bin/activate
-
 PARAMS_FILE=${PARAMS_FILE:-params.txt}
 LINE=$(sed -n "${SLURM_ARRAY_TASK_ID}p" "$PARAMS_FILE")
 read -r ALPHA NE SEED <<< "$LINE"
