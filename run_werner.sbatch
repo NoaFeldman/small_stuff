@@ -35,7 +35,7 @@ python run_werner.py \
     --alpha-min -1.0 \
     --alpha-max  1.0 \
     --n-alpha 21 \
-    --n-restarts 4 \
+    --n-restarts 256 \
     --max-iter 2000 \
     --seed 0 \
     --out-dir results \
