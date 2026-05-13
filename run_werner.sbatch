@@ -5,12 +5,12 @@
 #SBATCH --time=12:00:00
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=4G
-#SBATCH --array=1-3
+#SBATCH --array=1-63
 
 # ---- Usage -----------------------------------------------------------------
-# 1) Generate the parameter grid (one NE per line):
-#       python make_params.py --NE-list 3 6 9
-#    Update --array=1-<number of lines> if you change --NE-list.
+# 1) Generate the parameter grid (one (NE, alpha) per line):
+#       python make_params.py --NE-list 3 6 9 --n-alpha 21
+#    Update --array=1-<number of lines> if you change the grid.
 # 2) Submit:   sbatch run_werner.sbatch
 # 3) Collect:  python collect.py --in-dir results --out results.csv
 # ---------------------------------------------------------------------------
@@ -20,9 +20,11 @@ set -euo pipefail
 mkdir -p logs results
 
 PARAMS_FILE=${PARAMS_FILE:-params.txt}
-NE=$(sed -n "${SLURM_ARRAY_TASK_ID}p" "$PARAMS_FILE")
+LINE=$(sed -n "${SLURM_ARRAY_TASK_ID}p" "$PARAMS_FILE")
+NE=$(echo "$LINE" | awk '{print $1}')
+ALPHA=$(echo "$LINE" | awk '{print $2}')
 
-echo "Task ${SLURM_ARRAY_TASK_ID}: NE=${NE}"
+echo "Task ${SLURM_ARRAY_TASK_ID}: NE=${NE}  alpha=${ALPHA}"
 
 # Keep BLAS single-threaded so cpus-per-task=1 is honored.
 export OMP_NUM_THREADS=1
@@ -32,9 +34,7 @@ export JAX_PLATFORMS=cpu
 
 python run_werner.py \
     --NE "${NE}" \
-    --alpha-min -1.0 \
-    --alpha-max  1.0 \
-    --n-alpha 21 \
+    --alpha "${ALPHA}" \
     --n-restarts 256 \
     --max-iter 2000 \
     --seed 0 \
