@@ -1,25 +1,24 @@
 #!/bin/bash
-#SBATCH --job-name=werner_sq
-#SBATCH --output=logs/werner_%A_%a.out
-#SBATCH --error=logs/werner_%A_%a.err
-#SBATCH --time=12:00:00
+#SBATCH --job-name=esq_scan
+#SBATCH --output=logs/esq_%A_%a.out
+#SBATCH --error=logs/esq_%A_%a.err
+#SBATCH --time=24:00:00
 #SBATCH --cpus-per-task=1
-#SBATCH --mem=4G
-#SBATCH --array=1-63
+#SBATCH --mem=8G
+#SBATCH --array=1-55
 
 # ---- Usage -----------------------------------------------------------------
-# 1) Generate the parameter grid (one (NE, alpha) per line):
-#       python make_params.py --NE-list 3 6 9 --n-alpha 21
-#    Update --array=1-<number of lines> if you change the grid.
-# 2) Submit:   sbatch run_werner.sbatch
-# 3) Collect:  python collect.py --in-dir results --out results.csv
+# 1) Generate the parameter grid:
+#       python make_params_esq.py
+# 2) Submit:   sbatch run_esq.sbatch
+# 3) Collect & plot:  python collect_and_plot_esq.py
 # ---------------------------------------------------------------------------
 
 set -euo pipefail
 
-mkdir -p logs results
+mkdir -p logs results_esq
 
-PARAMS_FILE=${PARAMS_FILE:-params.txt}
+PARAMS_FILE=${PARAMS_FILE:-params_esq.txt}
 LINE=$(sed -n "${SLURM_ARRAY_TASK_ID}p" "$PARAMS_FILE")
 NE=$(echo "$LINE" | awk '{print $1}')
 ALPHA=$(echo "$LINE" | awk '{print $2}')
@@ -40,7 +39,6 @@ source /home/noafeld/my_jax_env/bin/activate
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
-export JAX_PLATFORMS=cpu
 
 python run_werner.py \
     --NE "${NE}" \
@@ -48,5 +46,5 @@ python run_werner.py \
     --n-restarts 256 \
     --max-iter 2000 \
     --seed 0 \
-    --out-dir results \
+    --out-dir results_esq \
     --task-id "${SLURM_ARRAY_TASK_ID}"
